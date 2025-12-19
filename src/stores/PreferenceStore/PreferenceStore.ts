@@ -122,6 +122,7 @@ export enum PreferenceKeys {
     PERFORMANCE_LIMIT_OVERLAY_REDRAW = "limitOverlayRedraw",
     PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT = "pvPreviewCubeSizeLimit",
     PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT = "pvPreviewCubeSizeLimitUnit",
+    PERFORMANCE_CPU_CHANNELS_PER_THREAD = "channelsPerThread",
 
     LOG_EVENT = "logEventList",
 
@@ -261,7 +262,8 @@ const DEFAULTS = {
         lowBandwidthMode: false,
         stopAnimationPlaybackMinutes: 5,
         limitOverlayRedraw: true,
-        pvPreviewCubeSizeLimit: 1
+        pvPreviewCubeSizeLimit: 1,
+        cpuChannelsPerThread: 8
     },
     LOG_EVENT: {
         eventLoggingEnabled: []
@@ -631,6 +633,10 @@ export class PreferenceStore {
         return this.preferences.get(PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT) ?? DEFAULTS.PERFORMANCE.pvPreviewCubeSizeLimit;
     }
 
+    @computed get cpuChannelsPerThread(): number {
+        return this.preferences.get(PreferenceKeys.PERFORMANCE_CPU_CHANNELS_PER_THREAD) ?? DEFAULTS.PERFORMANCE.cpuChannelsPerThread;
+    }
+
     @computed get isPVAxesOrderReverse(): boolean {
         return this.preferences.get(PreferenceKeys.SILENT_PV_AXES_ORDER_REVERSE) ?? DEFAULTS.SILENT.pvAxesOrderReverse;
     }
@@ -966,7 +972,8 @@ export class PreferenceStore {
             PreferenceKeys.PERFORMANCE_SYSTEM_TILE_CACHE,
             PreferenceKeys.PERFORMANCE_LIMIT_OVERLAY_REDRAW,
             PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT,
-            PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT
+            PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT,
+            PreferenceKeys.PERFORMANCE_CPU_CHANNELS_PER_THREAD
         ]);
     };
 
