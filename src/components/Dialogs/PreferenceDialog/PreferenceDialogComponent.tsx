@@ -97,10 +97,6 @@ export class PreferenceDialogComponent extends React.Component {
         PreferenceStore.Instance.setPreference(PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT, storedSize);
     }, 100);
 
-    private handleCpuChannelsPerThreadChange = _.throttle((value: number) => {
-        PreferenceStore.Instance.setPreference(PreferenceKeys.PERFORMANCE_CPU_CHANNELS_PER_THREAD, value);
-    }, 100);
-
     // variable for showing preview cube size unit in the dialog
     @observable private pvPreviewCubeSizeLimitUnit = "GB";
 
@@ -838,17 +834,6 @@ export class PreferenceDialogComponent extends React.Component {
                             </option>
                         </HTMLSelect>
                     </div>
-                </FormGroup>
-                <FormGroup inline={true} label="CPU channels per thread" labelInfo={"(ZARR spectral processing)"}>
-                    <SafeNumericInput
-                        placeholder="CPU channels per thread"
-                        min={1}
-                        max={64}
-                        value={preference.cpuChannelsPerThread}
-                        majorStepSize={1}
-                        stepSize={1}
-                        onValueChange={this.handleCpuChannelsPerThreadChange}
-                    />
                 </FormGroup>
             </React.Fragment>
         );

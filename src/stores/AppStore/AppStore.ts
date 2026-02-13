@@ -3477,11 +3477,7 @@ export class AppStore {
         this.spectralRequirements = updatedRequirements;
 
         if (diffList.length) {
-            const cpuChannelsPerThread = PreferenceStore.Instance.cpuChannelsPerThread;
-            diffList.forEach(requirements => {
-                requirements.cpuChannelsPerThread = cpuChannelsPerThread;
-                this.backendService.setSpectralRequirements(requirements);
-            });
+            diffList.forEach(requirements => this.backendService.setSpectralRequirements(requirements));
         }
     }
 
