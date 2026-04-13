@@ -93,6 +93,7 @@ export enum PreferenceKeys {
     PERFORMANCE_LIMIT_OVERLAY_REDRAW = "limitOverlayRedraw",
     PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT = "pvPreviewCubeSizeLimit",
     PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT = "pvPreviewCubeSizeLimitUnit",
+    PERFORMANCE_FILE_IO = "file_io_concurrency",
 
     LOG_EVENT = "logEventList",
 

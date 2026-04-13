@@ -118,7 +118,8 @@ const DEFAULTS = {
         lowBandwidthMode: false,
         stopAnimationPlaybackMinutes: 5,
         limitOverlayRedraw: true,
-        pvPreviewCubeSizeLimit: 1
+        pvPreviewCubeSizeLimit: 1,
+        file_io_concurrency: 2,
     },
     LOG_EVENT: {
         eventLoggingEnabled: []
@@ -488,6 +489,10 @@ export class PreferenceStore {
         return this.preferences.get(PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT) ?? DEFAULTS.PERFORMANCE.pvPreviewCubeSizeLimit;
     }
 
+    @computed get fileIOConcurrency(): number {
+        return this.preferences.get(PreferenceKeys.PERFORMANCE_FILE_IO) ?? DEFAULTS.PERFORMANCE.file_io_concurrency;
+    }
+
     @computed get isPVAxesOrderReverse(): boolean {
         return this.preferences.get(PreferenceKeys.SILENT_PV_AXES_ORDER_REVERSE) ?? DEFAULTS.SILENT.pvAxesOrderReverse;
     }
@@ -823,7 +828,8 @@ export class PreferenceStore {
             PreferenceKeys.PERFORMANCE_SYSTEM_TILE_CACHE,
             PreferenceKeys.PERFORMANCE_LIMIT_OVERLAY_REDRAW,
             PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT,
-            PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT
+            PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT_UNIT,
+            PreferenceKeys.PERFORMANCE_FILE_IO
         ]);
     };
 
