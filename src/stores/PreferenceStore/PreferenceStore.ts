@@ -119,7 +119,7 @@ const DEFAULTS = {
         stopAnimationPlaybackMinutes: 5,
         limitOverlayRedraw: true,
         pvPreviewCubeSizeLimit: 1,
-        file_io_concurrency: 2,
+        file_io_concurrency: 2
     },
     LOG_EVENT: {
         eventLoggingEnabled: []

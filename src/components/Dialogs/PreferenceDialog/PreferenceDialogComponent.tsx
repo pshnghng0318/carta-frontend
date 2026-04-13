@@ -842,15 +842,7 @@ export class PreferenceDialogComponent extends React.Component {
                     </div>
                 </FormGroup>
                 <FormGroup inline={true} label="File I/O concurrency" labelInfo={"(ZARR)"}>
-                    <SafeNumericInput
-                        placeholder="File I/O threads"
-                        min={1}
-                        max={64}
-                        value={preference.fileIOConcurrency}
-                        majorStepSize={1}
-                        stepSize={1}
-                        onValueChange={this.handleFileIOChange}
-                    />
+                    <SafeNumericInput placeholder="File I/O threads" min={1} max={64} value={preference.fileIOConcurrency} majorStepSize={1} stepSize={1} onValueChange={this.handleFileIOChange} />
                 </FormGroup>
             </React.Fragment>
         );
