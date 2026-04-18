@@ -489,10 +489,6 @@ export class PreferenceStore {
         return this.preferences.get(PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT) ?? DEFAULTS.PERFORMANCE.pvPreviewCubeSizeLimit;
     }
 
-    @computed get fileIOConcurrency(): number {
-        return this.preferences.get(PreferenceKeys.PERFORMANCE_FILE_IO) ?? DEFAULTS.PERFORMANCE.file_io_concurrency;
-    }
-
     @computed get isPVAxesOrderReverse(): boolean {
         return this.preferences.get(PreferenceKeys.SILENT_PV_AXES_ORDER_REVERSE) ?? DEFAULTS.SILENT.pvAxesOrderReverse;
     }

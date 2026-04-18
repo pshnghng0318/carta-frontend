@@ -97,10 +97,6 @@ export class PreferenceDialogComponent extends React.Component {
         PreferenceStore.Instance.setPreference(PreferenceKeys.PERFORMANCE_PV_PREVIEW_CUBE_SIZE_LIMIT, storedSize);
     }, 100);
 
-    private handleFileIOChange = _.throttle((value: number) => {
-        PreferenceStore.Instance.setPreference(PreferenceKeys.PERFORMANCE_FILE_IO, value);
-    }, 100);
-
     // variable for showing preview cube size unit in the dialog
     @observable private pvPreviewCubeSizeLimitUnit = "GB";
 
@@ -840,9 +836,6 @@ export class PreferenceDialogComponent extends React.Component {
                             </option>
                         </HTMLSelect>
                     </div>
-                </FormGroup>
-                <FormGroup inline={true} label="File I/O concurrency" labelInfo={"(ZARR)"}>
-                    <SafeNumericInput placeholder="File I/O threads" min={1} max={8} value={preference.fileIOConcurrency} majorStepSize={1} stepSize={1} onValueChange={this.handleFileIOChange} />
                 </FormGroup>
             </React.Fragment>
         );
