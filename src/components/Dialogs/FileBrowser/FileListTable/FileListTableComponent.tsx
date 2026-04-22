@@ -82,17 +82,24 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
         return FileListTableComponent.CatalogFileTypeMap.get(type) || {type: "Unknown", description: "An unknown file format"};
     }
 
-    private static GetFileSizeDisplay(sizeInBytes: number): string {
+    private static GetFileSizeDisplay(sizeInBytes: number, isZarr: boolean): string {
+        // Display an approximate size of ZARR
+        let LESSorAPPROXIMATELY = "";
+        if (isZarr) {
+            // Define LESSorAPPROXIMATELY before display number if it's ZARR file, since the size of ZARR is approximate
+            LESSorAPPROXIMATELY = "<";
+        }
+
         if (sizeInBytes >= 1e12) {
-            return `${toFixed(sizeInBytes / 1e12, 2)} TB`;
+            return `${LESSorAPPROXIMATELY}${toFixed(sizeInBytes / 1e12, 2)} TB`;
         } else if (sizeInBytes >= 1e9) {
-            return `${toFixed(sizeInBytes / 1e9, 1)} GB`;
+            return `${LESSorAPPROXIMATELY}${toFixed(sizeInBytes / 1e9, 1)} GB`;
         } else if (sizeInBytes >= 1e6) {
-            return `${toFixed(sizeInBytes / 1e6, 1)} MB`;
+            return `${LESSorAPPROXIMATELY}${toFixed(sizeInBytes / 1e6, 1)} MB`;
         } else if (sizeInBytes >= 1e3) {
-            return `${toFixed(sizeInBytes / 1e3, 1)} kB`;
+            return `${LESSorAPPROXIMATELY}${toFixed(sizeInBytes / 1e3, 1)} kB`;
         } else {
-            return `${sizeInBytes} B`;
+            return `${LESSorAPPROXIMATELY}${sizeInBytes} B`;
         }
     }
 
@@ -378,7 +385,7 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
             <Cell>
                 <React.Fragment>
                     <div onClick={event => this.handleEntryClicked(event, entry, rowIndex)} onDoubleClick={() => this.handleEntryDoubleClicked(entry)}>
-                        {entry.isFile && entry.size !== undefined && isFinite(entry.size) && FileListTableComponent.GetFileSizeDisplay(entry.size)}
+                        {entry.isFile && entry.size !== undefined && isFinite(entry.size) && FileListTableComponent.GetFileSizeDisplay(entry.size, entry.typeInfo?.type === "ZARR")}
                         {!entry.isFile && entry.itemCount !== undefined && isFinite(entry.itemCount) && `${entry.itemCount} items`}
                     </div>
                 </React.Fragment>
