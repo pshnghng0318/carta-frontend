@@ -1,10 +1,11 @@
 import * as React from "react";
 import {Button, Classes, Icon, Label, NonIdealState, Spinner} from "@blueprintjs/core";
-import {Cell, Column, ColumnHeaderCell, type Region, Regions, RenderMode, SelectionModes, Table2, TableLoadingOption} from "@blueprintjs/table";
+import {Cell, Column, ColumnHeaderCell, type Region, Regions, RenderMode, SelectionModes, Table, TableLoadingOption} from "@blueprintjs/table";
 import {CARTA} from "carta-protobuf";
 import classNames from "classnames";
 import FuzzySearch from "fuzzy-search";
 import globToRegExp from "glob-to-regexp";
+import Long from "long";
 import {action, makeObservable, observable, runInAction} from "mobx";
 import {observer} from "mobx-react";
 import moment from "moment";
@@ -23,7 +24,7 @@ interface FileEntry extends ISelectedFile {
     itemCount?: number;
     size?: number;
     date?: number;
-    fileInfo?: CARTA.IFileInfo | CARTA.ICatalogFileInfo;
+    fileInfo?: CARTA.FileInfo.$Properties | CARTA.CatalogFileInfo.$Properties;
     hdu?: string;
 }
 
@@ -33,7 +34,7 @@ export interface FileListTableComponentProps {
     extendedLoading?: boolean;
     fileProgress?: {total: number; checked: number};
     fileList: BrowserFileList | null;
-    selectedFile: CARTA.IFileInfo | CARTA.ICatalogFileInfo | null | undefined;
+    selectedFile: CARTA.FileInfo.$Properties | CARTA.CatalogFileInfo.$Properties | null | undefined;
     selectedHDU: string;
     filterType: FileFilteringType;
     filterString?: string;
@@ -53,7 +54,7 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
     @observable columnWidths = [360, 80, 90, 106];
 
     private static readonly RowHeight = 22;
-    private tableRef: Table2 | null = null;
+    private tableRef: Table | null = null;
     private cachedFilterString: string | undefined;
     private cachedSortingString: string | undefined;
     private cachedFileList: BrowserFileList | null;
@@ -79,6 +80,19 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
 
     private static getCatalogFileTypeDisplay(type: CARTA.CatalogFileType) {
         return FileListTableComponent.CatalogFileTypeMap.get(type) || {type: "Unknown", description: "An unknown file format"};
+    }
+
+    // 64-bit protobuf fields (file size, date) are decoded as Long objects, which have no valueOf(); comparing two of them
+    // with < or > falls back to comparing their decimal strings, so convert to a plain number before sorting or displaying
+    private static toNumber(value: number | Long | null | undefined): number {
+        if (value === null || value === undefined) {
+            return 0;
+        }
+        return Long.isLong(value) ? value.toNumber() : value;
+    }
+
+    private static compareNumbers(a: number | Long | null | undefined, b: number | Long | null | undefined): number {
+        return FileListTableComponent.toNumber(a) - FileListTableComponent.toNumber(b);
     }
 
     private static getFileSizeDisplay(sizeInBytes: number): string {
@@ -151,10 +165,10 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                     filteredSubdirectories.sort((a, b) => sortingConfig.direction * ((a.name || "").toLowerCase() < (b.name || "").toLowerCase() ? -1 : 1));
                     break;
                 case "size":
-                    filteredSubdirectories.sort((a, b) => sortingConfig.direction * ((a.itemCount || 0) < (b.itemCount || 0) ? -1 : 1));
+                    filteredSubdirectories.sort((a, b) => sortingConfig.direction * FileListTableComponent.compareNumbers(a.itemCount, b.itemCount));
                     break;
                 case "date":
-                    filteredSubdirectories.sort((a, b) => sortingConfig.direction * ((a.date || 0) < (b.date || 0) ? -1 : 1));
+                    filteredSubdirectories.sort((a, b) => sortingConfig.direction * FileListTableComponent.compareNumbers(a.date, b.date));
                     break;
                 default:
                     break;
@@ -165,8 +179,8 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                     entries.push({
                         filename: directory.name || "",
                         typeInfo: FileListTableComponent.getFileTypeDisplay(directory.type),
-                        size: directory.size as number,
-                        date: directory.date as number,
+                        size: FileListTableComponent.toNumber(directory.size),
+                        date: FileListTableComponent.toNumber(directory.date),
                         isDirectory: true,
                         isFile: true,
                         fileInfo: {name: directory.name, type: directory.type, size: directory.size, HDUList: directory.HDUList, date: directory.date}
@@ -175,7 +189,7 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                     entries.push({
                         filename: directory.name || "",
                         itemCount: directory.itemCount && directory.itemCount > 0 ? directory.itemCount : undefined,
-                        date: directory.date as number,
+                        date: FileListTableComponent.toNumber(directory.date),
                         isDirectory: true,
                         fileInfo: {name: directory.name}
                     });
@@ -192,36 +206,40 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                     filteredFiles.sort((a, b) => sortingConfig.direction * (a.type < b.type ? -1 : 1));
                     break;
                 case "size":
-                    filteredFiles.sort((a, b) => sortingConfig.direction * (a.size < b.size ? -1 : 1));
+                    if (fileBrowserMode === BrowserMode.Catalog) {
+                        (filteredFiles as CARTA.CatalogFileInfo.$Properties[]).sort((a, b) => sortingConfig.direction * FileListTableComponent.compareNumbers(a.fileSize, b.fileSize));
+                    } else {
+                        (filteredFiles as CARTA.FileInfo.$Properties[]).sort((a, b) => sortingConfig.direction * FileListTableComponent.compareNumbers(a.size, b.size));
+                    }
                     break;
                 case "date":
-                    filteredFiles.sort((a, b) => sortingConfig.direction * (a.date < b.date ? -1 : 1));
+                    filteredFiles.sort((a, b) => sortingConfig.direction * FileListTableComponent.compareNumbers(a.date, b.date));
                     break;
                 default:
                     break;
             }
 
             if (fileBrowserMode === BrowserMode.Catalog) {
-                for (const file of filteredFiles as CARTA.ICatalogFileInfo[]) {
+                for (const file of filteredFiles as CARTA.CatalogFileInfo.$Properties[]) {
                     entries.push({
                         filename: file.name || "",
                         typeInfo: file.type != null ? FileListTableComponent.getCatalogFileTypeDisplay(file.type) : undefined,
-                        size: file.fileSize as number,
-                        date: file.date as number,
+                        size: FileListTableComponent.toNumber(file.fileSize),
+                        date: FileListTableComponent.toNumber(file.date),
                         fileInfo: file,
                         isFile: true
                     });
                 }
             } else if (fileBrowserMode === BrowserMode.File) {
-                for (const file of filteredFiles as CARTA.IFileInfo[]) {
+                for (const file of filteredFiles as CARTA.FileInfo.$Properties[]) {
                     if (file.HDUList) {
                         for (const hdu of file.HDUList) {
                             const filename = file.HDUList.length > 1 ? `${file.name || ""}: HDU ${hdu}` : file.name || "";
                             entries.push({
                                 filename,
                                 typeInfo: file.type != null ? FileListTableComponent.getFileTypeDisplay(file.type) : undefined,
-                                size: file.size as number,
-                                date: file.date as number,
+                                size: FileListTableComponent.toNumber(file.size),
+                                date: FileListTableComponent.toNumber(file.date),
                                 fileInfo: file,
                                 hdu,
                                 isFile: true
@@ -230,12 +248,12 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                     }
                 }
             } else {
-                for (const file of filteredFiles as CARTA.IFileInfo[]) {
+                for (const file of filteredFiles as CARTA.FileInfo.$Properties[]) {
                     entries.push({
                         filename: file.name || "",
                         typeInfo: file.type != null ? FileListTableComponent.getFileTypeDisplay(file.type) : undefined,
-                        size: file.size as number,
-                        date: file.date as number,
+                        size: FileListTableComponent.toNumber(file.size),
+                        date: FileListTableComponent.toNumber(file.date),
                         fileInfo: file,
                         isFile: true
                     });
@@ -499,8 +517,10 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
         }
 
         const table = (
-            <Table2
-                ref={ref => (this.tableRef = ref)}
+            <Table
+                ref={ref => {
+                    this.tableRef = ref;
+                }}
                 className={classes.join(" ")}
                 enableRowReordering={false}
                 renderMode={RenderMode.NONE}
@@ -523,7 +543,7 @@ export class FileListTableComponent extends React.Component<FileListTableCompone
                 <Column name="Type" columnHeaderCellRenderer={() => this.renderColumnHeader("Type")} cellRenderer={this.renderTypes} />
                 <Column name="Size" columnHeaderCellRenderer={() => this.renderColumnHeader("Size")} cellRenderer={this.renderSizes} />
                 <Column name="Date" columnHeaderCellRenderer={() => this.renderColumnHeader("Date")} cellRenderer={this.renderDates} />
-            </Table2>
+            </Table>
         );
 
         return (

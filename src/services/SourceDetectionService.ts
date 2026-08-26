@@ -5,19 +5,52 @@ import {type FrameStore} from "stores/Frame";
 import {type RawRasterROI, TileService} from "./TileService";
 
 const MODEL_SIZE = 640;
-const RAW_CANDIDATE_THRESHOLD = 0.0001;
+const RAW_CANDIDATE_THRESHOLD = 0.05;
 const NMS_IOU_THRESHOLD = 0.45;
 const RAW_CONFIDENCE_KEEP_PRIORITY = 0.9;
 const HIGH_RAW_NMS_IOU_THRESHOLD = 0.65;
 const MAX_ONNX_CANDIDATES = 1000;
 const PEAK_FLUX_FLOOR_FRACTION = 0.01;
 const AVERAGE_FLUX_FLOOR_FRACTION = 0.0001;
-const RAW_CONFIDENCE_FLOOR = 0.01;
-const GALAXY_SAME_CLASS_IOU_THRESHOLD = 0.35;
+const RAW_CONFIDENCE_FLOOR = 0.05;
+const EXTENDED_SAME_CLASS_IOU_THRESHOLD = 0.35;
+// Empirical correction for confidence loss on elongated, diagonally oriented
+// sources (observed in the ACDC model, applied uniformly to every model's
+// output). Round and axis-aligned sources are unchanged.
+const DIAGONAL_ORIENTATION_CONFIDENCE_WEIGHT = 4.5;
+const GALAXY_MOMENT_FIT_EXPANSION = 5;
+const FWHM_SIGMA_FACTOR = 2 * Math.sqrt(2 * Math.log(2));
+const ELLIPSE_AXIS_FWHM_MULTIPLIER = 2;
 // CARTA's ZFP worker restores blank/NaN pixels as -FLT_MAX because some
 // shader implementations cannot reliably test NaN.
 const CARTA_BLANK_PIXEL = -3.402823466e38;
-const CLASS_NAMES = ["point", "galaxy"];
+
+interface SourceDetectionModelDefinition {
+    /** File name under public/models/. */
+    file: string;
+    /** Human-readable name used in logs. */
+    label: string;
+    /** YOLO class names in the order the model's head emits them. */
+    classNames: string[];
+}
+
+// Two independently trained YOLO11n detectors are ensembled: the ACDC model
+// is tuned for compact point/galaxy morphology, while the Roboflow Universe
+// astronomy model was trained on a broader 9-class dataset (including
+// extended/diffuse structures) and can pick up point-like sources - such as
+// saturated, diffraction-spiked stars - that the ACDC model misses or scores
+// too low. Detections from both models are merged and then deduplicated by
+// the existing same-class overlap suppression below.
+const ACDC_CLASS_NAMES = ["point", "galaxy"];
+const ROBOFLOW_CLASS_NAMES = ["point", "arc", "jet", "diffuse", "extended_ring", "nebula", "shell", "planet", "galaxy"];
+const MODEL_DEFINITIONS: SourceDetectionModelDefinition[] = [
+    {file: "acdc_point_galaxy.onnx", label: "ACDC point/galaxy", classNames: ACDC_CLASS_NAMES},
+    {file: "roboflow_universe.onnx", label: "Roboflow astronomy 9-class", classNames: ROBOFLOW_CLASS_NAMES}
+];
+// Classes that represent resolved/extended morphology and should use the
+// wider connected-component moment fit that was previously reserved for
+// "galaxy" alone.
+const EXTENDED_CLASS_NAMES = new Set(["galaxy", "nebula", "shell", "diffuse", "extended_ring", "arc"]);
 
 export interface SourceDetection {
     id: string;
@@ -25,6 +58,8 @@ export interface SourceDetection {
     className: string;
     /** Model confidence before display calibration. */
     rawConfidence?: number;
+    /** Raw confidence after bounded morphology/orientation calibration. */
+    calibratedRawConfidence?: number;
     confidence: number;
     /** [x, y, width, height] in CARTA image-pixel coordinates. */
     bboxPx: [number, number, number, number];
@@ -49,8 +84,12 @@ export class SourceDetectionService {
         return SourceDetectionService.staticInstance;
     }
 
-    private sessionPromise: Promise<ort.InferenceSession> | null = null;
+    private sessionPromises = new Map<string, Promise<ort.InferenceSession>>();
     private readonly resultCache = new Map<string, SourceDetection[]>();
+    // onnxruntime-web's WASM backend cannot safely execute multiple sessions
+    // concurrently in the same worker. Keep the complete ensemble pipeline
+    // single-flight so separate frames/overlays cannot overlap inference.
+    private inferenceQueue: Promise<void> = Promise.resolve();
 
     private constructor() {
         ort.env.wasm.numThreads = globalThis.crossOriginIsolated ? Math.max(1, Math.min(4, navigator.hardwareConcurrency || 1)) : 1;
@@ -63,6 +102,18 @@ export class SourceDetectionService {
     }
 
     async detectVisibleSources(frame: FrameStore): Promise<SourceDetectionResult | null> {
+        const detectionPromise = this.inferenceQueue.then(() => this.detectVisibleSourcesSerial(frame));
+        // Keep the queue usable after an inference failure. The caller still
+        // receives the rejection from detectionPromise and can retain its
+        // previous overlay instead of caching an incomplete ensemble.
+        this.inferenceQueue = detectionPromise.then(
+            () => undefined,
+            () => undefined
+        );
+        return detectionPromise;
+    }
+
+    private async detectVisibleSourcesSerial(frame: FrameStore): Promise<SourceDetectionResult | null> {
         const cacheKey = this.getCacheKey(frame);
         const cached = this.resultCache.get(cacheKey);
         if (cached) {
@@ -75,15 +126,31 @@ export class SourceDetectionService {
             return null;
         }
 
-        const session = await this.getSession();
-        const inputChannels = this.getInputChannels(session);
-        const tensorData = this.prepareTensor(roi, inputChannels);
-        const tensor = new ort.Tensor("float32", tensorData, [1, inputChannels, MODEL_SIZE, MODEL_SIZE]);
-        const results = await session.run({[session.inputNames[0]]: tensor});
-        const output = results[session.outputNames[0]];
-        // Use only the ACDC point/galaxy ONNX model. The legacy connected-component
-        // extended detector is intentionally not part of this pipeline.
-        const pointDetections = this.parseOutput(output, roi).map(detection => this.applyModelPostProcessing(detection, roi));
+        // Run every registered model sequentially on the same viewport ROI
+        // and merge their proposals. Duplicate detections of the same object
+        // (e.g. a bright star both models flag as "point") are collapsed by
+        // suppressOverlappingSameClass, which matches by className. A failed
+        // model rejects the whole pass so partial ensemble results are never
+        // displayed or cached.
+        const perModelDetections: SourceDetection[][] = [];
+        for (const definition of MODEL_DEFINITIONS) {
+            try {
+                const session = await this.getSession(definition);
+                const inputChannels = this.getInputChannels(session);
+                const tensorData = this.prepareTensor(roi, inputChannels);
+                const tensor = new ort.Tensor("float32", tensorData, [1, inputChannels, MODEL_SIZE, MODEL_SIZE]);
+                const results = await session.run({[session.inputNames[0]]: tensor});
+                const output = results[session.outputNames[0]];
+                perModelDetections.push(this.parseOutput(output, roi, definition).map(detection => this.applyModelPostProcessing(detection, roi)));
+            } catch (error) {
+                // Recreate a session after a failed run in case the WASM
+                // backend invalidated its native session state.
+                this.sessionPromises.delete(definition.file);
+                console.error(`[SourceDetection] ${definition.label} model failed`, error);
+                throw error;
+            }
+        }
+        const pointDetections = perModelDetections.flat();
         const galaxyDetections = pointDetections.filter(detection => detection.className === "galaxy");
         // Retain the reference display rule for model-produced galaxy boxes:
         // do not also show point proposals centred inside the same box.
@@ -103,7 +170,9 @@ export class SourceDetectionService {
         // point and galaxy proposals.
         const maximumPeakFlux = overlapFiltered.reduce((maximum, detection) => Math.max(maximum, detection.peakFlux), 0);
         const minimumPeakFlux = maximumPeakFlux * PEAK_FLUX_FLOOR_FRACTION;
-        const qualityFiltered = overlapFiltered.filter(detection => (detection.rawConfidence ?? detection.confidence) >= RAW_CONFIDENCE_FLOOR && (maximumPeakFlux <= 0 || detection.peakFlux >= minimumPeakFlux));
+        const qualityFiltered = overlapFiltered.filter(
+            detection => (detection.calibratedRawConfidence ?? detection.rawConfidence ?? detection.confidence) >= RAW_CONFIDENCE_FLOOR && (maximumPeakFlux <= 0 || detection.peakFlux >= minimumPeakFlux)
+        );
         // Port the reference project's mean-flux-per-pixel display gate:
         // Gaussian total flux divided by the ellipse area must be at least
         // 0.01% of the brightest average-flux source.
@@ -120,7 +189,7 @@ export class SourceDetectionService {
         const overlapGalaxies = overlapFiltered.filter(detection => detection.className === "galaxy").length;
         const displayedGalaxies = detections.filter(detection => detection.className === "galaxy").length;
         console.info(
-            `[SourceDetection] ACDC post-processing model=${pointDetections.length}, galaxies=${galaxyDetections.length}, spatial=${spatiallyFiltered.length}, overlap=${overlapFiltered.length} (${overlapGalaxies} galaxies), quality=${qualityFiltered.length}, averageFlux=${averageFluxFiltered.length}, displayed=${detections.length} (${displayedGalaxies} galaxies)`
+            `[SourceDetection] Ensemble post-processing model=${pointDetections.length}, galaxies=${galaxyDetections.length}, spatial=${spatiallyFiltered.length}, overlap=${overlapFiltered.length} (${overlapGalaxies} galaxies), quality=${qualityFiltered.length}, averageFlux=${averageFluxFiltered.length}, displayed=${detections.length} (${displayedGalaxies} galaxies)`
         );
         console.debug(
             `[SourceDetection] Displayed candidates ${JSON.stringify(
@@ -130,6 +199,7 @@ export class SourceDetectionService {
                         center: detection.ellipsePx.slice(0, 2).map(value => Number(value.toFixed(1))),
                         radii: detection.ellipsePx.slice(2, 4).map(value => Number(value.toFixed(1))),
                         rawConfidence: Number((detection.rawConfidence ?? 0).toFixed(5)),
+                        calibratedRawConfidence: Number((detection.calibratedRawConfidence ?? detection.rawConfidence ?? 0).toFixed(5)),
                         confidence: Number(detection.confidence.toFixed(3)),
                         totalFlux: Number((detection.totalFlux ?? 0).toPrecision(4)),
                         averageFlux: Number(averageFlux(detection).toPrecision(4)),
@@ -143,15 +213,25 @@ export class SourceDetectionService {
         return {cacheKey, detections};
     }
 
-    private getSession(): Promise<ort.InferenceSession> {
-        if (!this.sessionPromise) {
-            const modelUrl = new URL("models/acdc_point_galaxy.onnx", document.baseURI).toString();
-            this.sessionPromise = ort.InferenceSession.create(modelUrl, {executionProviders: ["wasm"]}).then(session => {
-                console.info("[SourceDetection] ACDC point/galaxy model loaded");
+    private getSession(definition: SourceDetectionModelDefinition): Promise<ort.InferenceSession> {
+        let promise = this.sessionPromises.get(definition.file);
+        if (!promise) {
+            const modelUrl = new URL(`models/${definition.file}`, document.baseURI).toString();
+            promise = ort.InferenceSession.create(modelUrl, {executionProviders: ["wasm"]}).then(session => {
+                console.info(`[SourceDetection] ${definition.label} model loaded`);
                 return session;
             });
+            promise.catch(() => {
+                // Do not cache a failed load (e.g. a transient fetch error
+                // right after deploying a new build). Otherwise this model
+                // would be permanently disabled for the rest of the session.
+                if (this.sessionPromises.get(definition.file) === promise) {
+                    this.sessionPromises.delete(definition.file);
+                }
+            });
+            this.sessionPromises.set(definition.file, promise);
         }
-        return this.sessionPromise;
+        return promise;
     }
 
     private getInputChannels(session: ort.InferenceSession): number {
@@ -198,9 +278,10 @@ export class SourceDetectionService {
         return tensor;
     }
 
-    private parseOutput(output: ort.Tensor, roi: RawRasterROI): SourceDetection[] {
+    private parseOutput(output: ort.Tensor, roi: RawRasterROI, definition: SourceDetectionModelDefinition): SourceDetection[] {
         const raw = output.data as Float32Array;
         const dims = output.dims;
+        const classNames = definition.classNames;
         const candidates: SourceDetection[] = [];
         const addDetection = (cx: number, cy: number, width: number, height: number, confidence: number, classId: number) => {
             if (confidence < RAW_CANDIDATE_THRESHOLD) {
@@ -217,11 +298,11 @@ export class SourceDetectionService {
             const boxHeight = Math.max(10, Math.min(MODEL_SIZE, modelHeight * roi.imageHeight));
             const x = roi.xMin + modelCx * roi.imageWidth - boxWidth / 2;
             const y = roi.yMin + modelCy * roi.imageHeight - boxHeight / 2;
-            const safeClassId = Math.max(0, Math.min(CLASS_NAMES.length - 1, classId));
+            const safeClassId = Math.max(0, Math.min(classNames.length - 1, classId));
             candidates.push({
-                id: `${roi.xMin}:${roi.yMin}:${candidates.length}`,
+                id: `${definition.file}:${roi.xMin}:${roi.yMin}:${candidates.length}`,
                 classId: safeClassId,
-                className: CLASS_NAMES[safeClassId],
+                className: classNames[safeClassId],
                 confidence,
                 bboxPx: [x, y, boxWidth, boxHeight],
                 ellipsePx: [x + boxWidth / 2, y + boxHeight / 2, boxWidth / 2, boxHeight / 2, 0],
@@ -250,7 +331,7 @@ export class SourceDetectionService {
                         classId = classIndex;
                     }
                 }
-                addDetection(raw[anchor], raw[anchorCount + anchor], raw[2 * anchorCount + anchor], raw[3 * anchorCount + anchor], confidence, classId % CLASS_NAMES.length);
+                addDetection(raw[anchor], raw[anchorCount + anchor], raw[2 * anchorCount + anchor], raw[3 * anchorCount + anchor], confidence, classId);
             }
         } else {
             console.warn(`[SourceDetection] Unsupported ONNX output shape: ${dims.join("x")}`);
@@ -258,7 +339,7 @@ export class SourceDetectionService {
 
         const onnxCandidates = candidates.sort((a, b) => b.confidence - a.confidence).slice(0, MAX_ONNX_CANDIDATES);
         const kept = this.nonMaximumSuppression(onnxCandidates);
-        console.info(`[SourceDetection] ONNX candidates=${candidates.length}, threshold=${RAW_CANDIDATE_THRESHOLD}, retained=${kept.length}`);
+        console.info(`[SourceDetection] ${definition.label} candidates=${candidates.length}, threshold=${RAW_CANDIDATE_THRESHOLD}, retained=${kept.length}`);
         return kept;
     }
 
@@ -295,14 +376,23 @@ export class SourceDetectionService {
         const [boxX, boxY, boxWidth, boxHeight] = detection.bboxPx;
         const sampleScaleX = roi.imageWidth / roi.width;
         const sampleScaleY = roi.imageHeight / roi.height;
-        const x0 = Math.max(0, Math.floor((boxX - roi.xMin) / sampleScaleX));
-        const y0 = Math.max(0, Math.floor((boxY - roi.yMin) / sampleScaleY));
-        const x1 = Math.min(roi.width - 1, Math.ceil((boxX + boxWidth - roi.xMin) / sampleScaleX));
-        const y1 = Math.min(roi.height - 1, Math.ceil((boxY + boxHeight - roi.yMin) / sampleScaleY));
+        const proposalX0 = Math.max(0, Math.floor((boxX - roi.xMin) / sampleScaleX));
+        const proposalY0 = Math.max(0, Math.floor((boxY - roi.yMin) / sampleScaleY));
+        const proposalX1 = Math.min(roi.width - 1, Math.ceil((boxX + boxWidth - roi.xMin) / sampleScaleX));
+        const proposalY1 = Math.min(roi.height - 1, Math.ceil((boxY + boxHeight - roi.yMin) / sampleScaleY));
+        const fitExpansion = EXTENDED_CLASS_NAMES.has(detection.className) ? GALAXY_MOMENT_FIT_EXPANSION : 1;
+        const proposalCenterX = (proposalX0 + proposalX1) / 2;
+        const proposalCenterY = (proposalY0 + proposalY1) / 2;
+        const fitHalfWidth = ((proposalX1 - proposalX0 + 1) * fitExpansion) / 2;
+        const fitHalfHeight = ((proposalY1 - proposalY0 + 1) * fitExpansion) / 2;
+        const fitX0 = Math.max(0, Math.floor(proposalCenterX - fitHalfWidth));
+        const fitY0 = Math.max(0, Math.floor(proposalCenterY - fitHalfHeight));
+        const fitX1 = Math.min(roi.width - 1, Math.ceil(proposalCenterX + fitHalfWidth));
+        const fitY1 = Math.min(roi.height - 1, Math.ceil(proposalCenterY + fitHalfHeight));
         const backgroundSamples: number[] = [];
-        for (let y = y0; y <= y1; y++) {
-            for (let x = x0; x <= x1; x++) {
-                if (x === x0 || x === x1 || y === y0 || y === y1) {
+        for (let y = fitY0; y <= fitY1; y++) {
+            for (let x = fitX0; x <= fitX1; x++) {
+                if (x === fitX0 || x === fitX1 || y === fitY0 || y === fitY1) {
                     const value = roi.data[y * roi.width + x];
                     if (this.isValidSciencePixel(value)) {
                         backgroundSamples.push(value);
@@ -313,25 +403,59 @@ export class SourceDetectionService {
         backgroundSamples.sort((a, b) => a - b);
         const localBackground = backgroundSamples.length ? backgroundSamples[Math.floor(backgroundSamples.length / 2)] : 0;
         let maximumSignal = 0;
-        for (let y = y0; y <= y1; y++) {
-            for (let x = x0; x <= x1; x++) {
+        let peakX = Math.round(proposalCenterX);
+        let peakY = Math.round(proposalCenterY);
+        for (let y = proposalY0; y <= proposalY1; y++) {
+            for (let x = proposalX0; x <= proposalX1; x++) {
                 const value = roi.data[y * roi.width + x];
                 if (this.isValidSciencePixel(value)) {
-                    maximumSignal = Math.max(maximumSignal, value - localBackground);
+                    const signal = value - localBackground;
+                    if (signal > maximumSignal) {
+                        maximumSignal = signal;
+                        peakX = x;
+                        peakY = y;
+                    }
                 }
             }
         }
 
-        const accumulateMoments = (minimumSignal: number) => {
+        const accumulateMoments = (minimumSignal: number, shouldUseConnectedPixels: boolean) => {
             let intensity = 0;
             let weightedX = 0;
             let weightedY = 0;
             let weightedXX = 0;
             let weightedYY = 0;
             let weightedXY = 0;
-            for (let y = y0; y <= y1; y++) {
-                for (let x = x0; x <= x1; x++) {
-                    const rawValue = roi.data[y * roi.width + x];
+
+            const addPixel = (x: number, y: number, signal: number) => {
+                const value = signal - minimumSignal;
+                const imageX = roi.xMin + x * sampleScaleX;
+                const imageY = roi.yMin + y * sampleScaleY;
+                intensity += value;
+                weightedX += value * imageX;
+                weightedY += value * imageY;
+                weightedXX += value * imageX * imageX;
+                weightedYY += value * imageY * imageY;
+                weightedXY += value * imageX * imageY;
+            };
+
+            if (shouldUseConnectedPixels) {
+                const fitWidth = fitX1 - fitX0 + 1;
+                const visited = new Uint8Array(fitWidth * (fitY1 - fitY0 + 1));
+                const stack: number[] = [peakY * roi.width + peakX];
+                while (stack.length) {
+                    const index = stack.pop()!;
+                    const x = index % roi.width;
+                    const y = Math.floor(index / roi.width);
+                    if (x < fitX0 || x > fitX1 || y < fitY0 || y > fitY1) {
+                        continue;
+                    }
+                    const visitedIndex = (y - fitY0) * fitWidth + (x - fitX0);
+                    if (visited[visitedIndex]) {
+                        continue;
+                    }
+                    visited[visitedIndex] = 1;
+                    const rawValue = roi.data[index];
                     if (!this.isValidSciencePixel(rawValue)) {
                         continue;
                     }
@@ -339,23 +463,40 @@ export class SourceDetectionService {
                     if (signal <= minimumSignal) {
                         continue;
                     }
-                    const value = signal - minimumSignal;
-                    const imageX = roi.xMin + x * sampleScaleX;
-                    const imageY = roi.yMin + y * sampleScaleY;
-                    intensity += value;
-                    weightedX += value * imageX;
-                    weightedY += value * imageY;
-                    weightedXX += value * imageX * imageX;
-                    weightedYY += value * imageY * imageY;
-                    weightedXY += value * imageX * imageY;
+                    addPixel(x, y, signal);
+                    for (let deltaY = -1; deltaY <= 1; deltaY++) {
+                        for (let deltaX = -1; deltaX <= 1; deltaX++) {
+                            if (deltaX || deltaY) {
+                                const neighborX = x + deltaX;
+                                const neighborY = y + deltaY;
+                                if (neighborX >= fitX0 && neighborX <= fitX1 && neighborY >= fitY0 && neighborY <= fitY1) {
+                                    stack.push(neighborY * roi.width + neighborX);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (let y = fitY0; y <= fitY1; y++) {
+                    for (let x = fitX0; x <= fitX1; x++) {
+                        const rawValue = roi.data[y * roi.width + x];
+                        if (!this.isValidSciencePixel(rawValue)) {
+                            continue;
+                        }
+                        const signal = rawValue - localBackground;
+                        if (signal > minimumSignal) {
+                            addPixel(x, y, signal);
+                        }
+                    }
                 }
             }
             return {intensity, weightedX, weightedY, weightedXX, weightedYY, weightedXY};
         };
 
-        let moments = accumulateMoments(Math.max(0, maximumSignal * 0.12));
+        const shouldUseConnectedPixels = EXTENDED_CLASS_NAMES.has(detection.className);
+        let moments = accumulateMoments(Math.max(0, maximumSignal * 0.12), shouldUseConnectedPixels);
         if (moments.intensity === 0) {
-            moments = accumulateMoments(0);
+            moments = accumulateMoments(0, shouldUseConnectedPixels);
         }
         if (moments.intensity === 0) {
             return {
@@ -375,23 +516,33 @@ export class SourceDetectionService {
         const sigmaMajor = Math.sqrt(Math.max((varianceX + varianceY) / 2 + discriminant, 0.01));
         const sigmaMinor = Math.sqrt(Math.max((varianceX + varianceY) / 2 - discriminant, 0.01));
         const angle = (Math.atan2(2 * covarianceXY, varianceX - varianceY) / 2) * (180 / Math.PI);
-        // Match the reference ACDC `source: "onnx"` display path: point
-        // regions use 1σ and galaxy regions use 3σ Gaussian radii instead of
-        // drawing the raw YOLO proposal box.
-        const sigmaFactor = detection.className === "point" ? 1 : 3;
+        // The full major/minor axis lengths are twice their fitted FWHM, so
+        // each canvas ellipse radius is one FWHM.
+        const sigmaFactor = (ELLIPSE_AXIS_FWHM_MULTIPLIER * FWHM_SIGMA_FACTOR) / 2;
         const radiusMajor = sigmaMajor * sigmaFactor;
         const radiusMinor = sigmaMinor * sigmaFactor;
         const radius = (radiusMajor + radiusMinor) / 2;
         const isNearlyRound = sigmaMajor / Math.max(sigmaMinor, 1e-6) < 1.15;
         const peakFlux = moments.intensity / (2 * Math.PI * Math.max(sigmaMajor, 0.5) * Math.max(sigmaMinor, 0.5));
+        const rawConfidence = detection.rawConfidence ?? detection.confidence;
+        const calibratedRawConfidence = this.calibrateOrientationRawConfidence(rawConfidence, sigmaMajor, sigmaMinor, angle);
         return {
             ...detection,
-            rawConfidence: detection.rawConfidence ?? detection.confidence,
-            confidence: this.calibrateDisplayConfidence(detection.confidence),
+            rawConfidence,
+            calibratedRawConfidence,
+            confidence: this.calibrateDisplayConfidence(calibratedRawConfidence),
             ellipsePx: [centerX, centerY, isNearlyRound ? radius : radiusMajor, isNearlyRound ? radius : radiusMinor, angle],
             totalFlux: moments.intensity,
             peakFlux
         };
+    }
+
+    private calibrateOrientationRawConfidence(rawConfidence: number, sigmaMajor: number, sigmaMinor: number, angleDegrees: number): number {
+        const elongation = Math.max(0, Math.min(1, 1 - sigmaMinor / Math.max(sigmaMajor, 1e-6)));
+        const angle = angleDegrees * (Math.PI / 180);
+        const diagonalAlignment = Math.sin(2 * angle) ** 2;
+        const correction = 1 + DIAGONAL_ORIENTATION_CONFIDENCE_WEIGHT * elongation * diagonalAlignment;
+        return Math.min(1, Math.max(0, rawConfidence) * correction);
     }
 
     private suppressOverlappingSameClass(detections: SourceDetection[]): SourceDetection[] {
@@ -407,7 +558,7 @@ export class SourceDetectionService {
                 return (
                     this.ellipseContainsPoint(parent.ellipsePx, centerX, centerY, 1) ||
                     this.ellipseContainsPoint(detection.ellipsePx, parentCenterX, parentCenterY, 1) ||
-                    (detection.className === "galaxy" && this.intersectionOverUnion(parent.bboxPx, detection.bboxPx) > GALAXY_SAME_CLASS_IOU_THRESHOLD)
+                    (EXTENDED_CLASS_NAMES.has(detection.className) && this.intersectionOverUnion(parent.bboxPx, detection.bboxPx) > EXTENDED_SAME_CLASS_IOU_THRESHOLD)
                 );
             });
             if (!isRepeatedRegion) {
@@ -418,8 +569,8 @@ export class SourceDetectionService {
     }
 
     private compareDetectionPriority(a: SourceDetection, b: SourceDetection): number {
-        const aRawConfidence = a.rawConfidence ?? a.confidence;
-        const bRawConfidence = b.rawConfidence ?? b.confidence;
+        const aRawConfidence = a.calibratedRawConfidence ?? a.rawConfidence ?? a.confidence;
+        const bRawConfidence = b.calibratedRawConfidence ?? b.rawConfidence ?? b.confidence;
         if (aRawConfidence !== bRawConfidence) {
             return bRawConfidence - aRawConfidence;
         }

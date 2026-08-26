@@ -18,6 +18,27 @@ interface SourceDetectionOverlayComponentProps {
 }
 
 const DETECTION_DEBOUNCE_MS = 350;
+// Source detection should not run as soon as a file is opened. Instead the
+// zoom level at the time the frame is mounted is recorded as the baseline,
+// and detection is only triggered once the user has zoomed in beyond this
+// multiplier relative to that baseline.
+const ZOOM_TRIGGER_MULTIPLIER = 3;
+// One color per class across both the ACDC and Roboflow Universe models, so
+// the 9-class ensemble output stays visually distinguishable. Unknown/future
+// class names fall back to the default cyan below.
+const CLASS_COLORS: Record<string, string> = {
+    point: "#00e5ff",
+    galaxy: "#1e3a8a",
+    star: "#facc15",
+    arc: "#f97316",
+    jet: "#ef4444",
+    diffuse: "#a78bfa",
+    extended_ring: "#ec4899",
+    nebula: "#34d399",
+    shell: "#38bdf8",
+    planet: "#fbbf24"
+};
+const DEFAULT_DETECTION_COLOR = "#00e5ff";
 
 @observer
 export class SourceDetectionOverlayComponent extends React.Component<SourceDetectionOverlayComponentProps> {
@@ -33,6 +54,9 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
     private lastCompletedCacheKey: string | undefined;
     private frameDisposer: IReactionDisposer | undefined;
     private tileSubscription: Subscription | undefined;
+    // Zoom level recorded when the file was opened; detection stays disabled
+    // until the frame is zoomed in beyond ZOOM_TRIGGER_MULTIPLIER times this value.
+    private baselineZoom: number | undefined;
 
     constructor(props: SourceDetectionOverlayComponentProps) {
         super(props);
@@ -40,6 +64,10 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
     }
 
     componentDidMount() {
+        // Record the zoom level at file-open time as the baseline. Detection
+        // is not run immediately; it only becomes active once the user zooms
+        // in beyond ZOOM_TRIGGER_MULTIPLIER times this baseline (see scheduleDetection).
+        this.baselineZoom = this.getEffectiveZoom(this.props.frame);
         AppStore.Instance.logStore.addInfo("Automatic source detection armed.", ["source-detection"]);
         this.frameDisposer = reaction(
             () => {
@@ -51,7 +79,7 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
                 return [frame.zoomLevel, frame.spatialReference?.zoomLevel, frame.center.x, frame.center.y, frame.channel, frame.stokes, view.xMin, view.yMin, view.xMax, view.yMax, view.mip];
             },
             this.scheduleDetection,
-            {fireImmediately: true}
+            {fireImmediately: false}
         );
 
         this.tileSubscription = TileService.Instance.tileStream.subscribe(message => {
@@ -85,6 +113,20 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
     };
 
     private scheduleDetection = () => {
+        if (!this.isZoomedInPastTrigger()) {
+            // Zoom hasn't crossed the trigger multiplier yet: keep detection
+            // disabled and clear any stale detections left from a previous run.
+            if (this.detections.length > 0 || this.lastCompletedCacheKey !== undefined) {
+                this.requestGeneration++;
+                clearTimeout(this.debounceHandle);
+                this.isDetecting = false;
+                this.shouldRerun = false;
+                this.detections = [];
+                this.lastCompletedCacheKey = undefined;
+                this.drawOverlay();
+            }
+            return;
+        }
         if (this.isDetecting) {
             this.shouldRerun = true;
             return;
@@ -145,7 +187,10 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
             if (generation === this.requestGeneration) {
                 console.error("[SourceDetection] Inference failed", error);
                 AppStore.Instance.logStore.addError(`Source detection failed: ${error instanceof Error ? error.message : String(error)}`, ["source-detection"]);
-                this.detections = [];
+                // Keep whatever was last displayed instead of clearing to
+                // empty: a transient failure (e.g. one WASM inference call
+                // erroring out) should not make every previously found
+                // source vanish from the overlay after a pan/zoom.
             }
         } finally {
             if (generation === this.requestGeneration) {
@@ -164,6 +209,15 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
 
     private getEffectiveZoom = (frame: FrameStore) => {
         return frame.spatialReference?.zoomLevel ?? frame.zoomLevel;
+    };
+
+    /** Whether the current zoom has crossed ZOOM_TRIGGER_MULTIPLIER times the zoom recorded when the file was opened. */
+    private isZoomedInPastTrigger = () => {
+        if (this.baselineZoom === undefined || !Number.isFinite(this.baselineZoom) || this.baselineZoom <= 0) {
+            return true;
+        }
+        const currentZoom = this.getEffectiveZoom(this.props.frame);
+        return currentZoom > this.baselineZoom * ZOOM_TRIGGER_MULTIPLIER;
     };
 
     private drawOverlay = () => {
@@ -194,7 +248,7 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
         const scaleY = height / (view.yMax - view.yMin);
         context.lineWidth = 1.5;
         context.font = "11px sans-serif";
-        context.textBaseline = "bottom";
+        context.textBaseline = "top";
 
         for (let index = 0; index < this.detections.length; index++) {
             const detection = this.detections[index];
@@ -207,7 +261,7 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
                 continue;
             }
 
-            const color = detection.className === "galaxy" ? "#22c55e" : "#00e5ff";
+            const color = CLASS_COLORS[detection.className] ?? DEFAULT_DETECTION_COLOR;
             context.strokeStyle = color;
             context.fillStyle = color;
             context.save();
@@ -217,7 +271,10 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
             context.ellipse(0, 0, Math.max(radiusX, 2), Math.max(radiusY, 2), 0, 0, Math.PI * 2);
             context.stroke();
             context.restore();
-            context.fillText(detection.className, centerX + Math.max(radiusX, 4) + 2, centerY + 4);
+            const labelX = centerX + Math.max(radiusX, 4) + 2;
+            const labelY = centerY - 7;
+            context.fillText(detection.className, labelX, labelY);
+            context.fillText(`conf ${detection.confidence.toFixed(3)}`, labelX, labelY + 13);
         }
 
         if (this.isDetecting) {
