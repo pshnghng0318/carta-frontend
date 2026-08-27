@@ -5,14 +5,22 @@ import {type FrameStore} from "stores/Frame";
 import {type RawRasterROI, TileService} from "./TileService";
 
 const MODEL_SIZE = 640;
-const RAW_CANDIDATE_THRESHOLD = 0.05;
+// Keep the proposal gate deliberately permissive. The stricter 5% floor is
+// applied after morphology calibration and flux fitting, so a model proposal
+// is not lost before those shared ensemble steps can evaluate it.
+const RAW_CANDIDATE_THRESHOLD = 0.0001;
 const NMS_IOU_THRESHOLD = 0.45;
 const RAW_CONFIDENCE_KEEP_PRIORITY = 0.9;
 const HIGH_RAW_NMS_IOU_THRESHOLD = 0.65;
 const MAX_ONNX_CANDIDATES = 1000;
-const PEAK_FLUX_FLOOR_FRACTION = 0.01;
 const AVERAGE_FLUX_FLOOR_FRACTION = 0.0001;
 const RAW_CONFIDENCE_FLOOR = 0.05;
+const GALAXY_POINT_MIN_AREA_RATIO = 4;
+// Use the robust 99.5th percentile as the asinh reference scale without
+// clipping brighter pixels to a flat white plateau.
+const INPUT_ASINH_STRETCH = 10;
+const INPUT_STRETCHES = ["clipped", "asinh"] as const;
+type InputStretch = (typeof INPUT_STRETCHES)[number];
 const EXTENDED_SAME_CLASS_IOU_THRESHOLD = 0.35;
 // Empirical correction for confidence loss on elongated, diagonally oriented
 // sources (observed in the ACDC model, applied uniformly to every model's
@@ -137,11 +145,20 @@ export class SourceDetectionService {
             try {
                 const session = await this.getSession(definition);
                 const inputChannels = this.getInputChannels(session);
-                const tensorData = this.prepareTensor(roi, inputChannels);
-                const tensor = new ort.Tensor("float32", tensorData, [1, inputChannels, MODEL_SIZE, MODEL_SIZE]);
-                const results = await session.run({[session.inputNames[0]]: tensor});
-                const output = results[session.outputNames[0]];
-                perModelDetections.push(this.parseOutput(output, roi, definition).map(detection => this.applyModelPostProcessing(detection, roi)));
+                const modelDetections: SourceDetection[] = [];
+                // Preserve the model's original clipped input distribution for
+                // its strongest classifications, then add a soft-stretched pass
+                // whose retained highlights expose structure inside bright,
+                // resolved sources. Shared post-processing consolidates the two
+                // passes just like it consolidates the two detector models.
+                for (const stretch of INPUT_STRETCHES) {
+                    const tensorData = this.prepareTensor(roi, inputChannels, stretch);
+                    const tensor = new ort.Tensor("float32", tensorData, [1, inputChannels, MODEL_SIZE, MODEL_SIZE]);
+                    const results = await session.run({[session.inputNames[0]]: tensor});
+                    const output = results[session.outputNames[0]];
+                    modelDetections.push(...this.parseOutput(output, roi, definition, stretch).map(detection => this.applyModelPostProcessing(detection, roi)));
+                }
+                perModelDetections.push(modelDetections);
             } catch (error) {
                 // Recreate a session after a failed run in case the WASM
                 // backend invalidated its native session state.
@@ -151,28 +168,30 @@ export class SourceDetectionService {
             }
         }
         const pointDetections = perModelDetections.flat();
-        const galaxyDetections = pointDetections.filter(detection => detection.className === "galaxy");
+        // Apply the final confidence floor before any cross-class spatial
+        // filtering. Otherwise a low-confidence galaxy can erase a valid
+        // point and then be removed by this same confidence rule later.
+        const confidenceFiltered = pointDetections.filter(detection => (detection.calibratedRawConfidence ?? detection.rawConfidence ?? detection.confidence) >= RAW_CONFIDENCE_FLOOR);
+        const galaxyDetections = confidenceFiltered.filter(detection => detection.className === "galaxy");
         // Retain the reference display rule for model-produced galaxy boxes:
-        // do not also show point proposals centred inside the same box.
-        const spatiallyFiltered = pointDetections.filter(detection => {
+        // do not also show a point proposal centred inside a clearly larger,
+        // qualified galaxy. Similar-sized competing classifications survive.
+        const spatiallyFiltered = confidenceFiltered.filter(detection => {
             if (detection.className !== "point") {
                 return true;
             }
             const [centerX, centerY] = detection.ellipsePx;
-            return !galaxyDetections.some(source => this.ellipseContainsPoint(source.ellipsePx, centerX, centerY, 1.05));
+            const pointArea = Math.PI * Math.abs(detection.ellipsePx[2] * detection.ellipsePx[3]);
+            return !galaxyDetections.some(source => {
+                const galaxyArea = Math.PI * Math.abs(source.ellipsePx[2] * source.ellipsePx[3]);
+                return galaxyArea >= pointArea * GALAXY_POINT_MIN_AREA_RATIO && this.ellipseContainsPoint(source.ellipsePx, centerX, centerY, 1.05);
+            });
         });
         // Port the reference project's confidence/region-size containment
         // suppression, scoped to one detected class. This removes repeated
         // proposals for the same point or extended object without allowing a
         // scene-scale galaxy ellipse to erase resolved point sources.
         const overlapFiltered = this.suppressOverlappingSameClass(spatiallyFiltered);
-        // Apply the same raw-confidence and peak-flux quality floors to both
-        // point and galaxy proposals.
-        const maximumPeakFlux = overlapFiltered.reduce((maximum, detection) => Math.max(maximum, detection.peakFlux), 0);
-        const minimumPeakFlux = maximumPeakFlux * PEAK_FLUX_FLOOR_FRACTION;
-        const qualityFiltered = overlapFiltered.filter(
-            detection => (detection.calibratedRawConfidence ?? detection.rawConfidence ?? detection.confidence) >= RAW_CONFIDENCE_FLOOR && (maximumPeakFlux <= 0 || detection.peakFlux >= minimumPeakFlux)
-        );
         // Port the reference project's mean-flux-per-pixel display gate:
         // Gaussian total flux divided by the ellipse area must be at least
         // 0.01% of the brightest average-flux source.
@@ -182,14 +201,14 @@ export class SourceDetectionService {
             const totalFlux = detection.totalFlux ?? 0;
             return Number.isFinite(totalFlux) && totalFlux > 0 && ellipsePixels > 0 ? totalFlux / ellipsePixels : 0;
         };
-        const maximumAverageFlux = qualityFiltered.reduce((maximum, detection) => Math.max(maximum, averageFlux(detection)), 0);
+        const maximumAverageFlux = overlapFiltered.reduce((maximum, detection) => Math.max(maximum, averageFlux(detection)), 0);
         const minimumAverageFlux = maximumAverageFlux * AVERAGE_FLUX_FLOOR_FRACTION;
-        const averageFluxFiltered = maximumAverageFlux > 0 ? qualityFiltered.filter(detection => averageFlux(detection) >= minimumAverageFlux) : qualityFiltered;
+        const averageFluxFiltered = maximumAverageFlux > 0 ? overlapFiltered.filter(detection => averageFlux(detection) >= minimumAverageFlux) : overlapFiltered;
         const detections = averageFluxFiltered.sort((a, b) => b.peakFlux - a.peakFlux);
         const overlapGalaxies = overlapFiltered.filter(detection => detection.className === "galaxy").length;
         const displayedGalaxies = detections.filter(detection => detection.className === "galaxy").length;
         console.info(
-            `[SourceDetection] Ensemble post-processing model=${pointDetections.length}, galaxies=${galaxyDetections.length}, spatial=${spatiallyFiltered.length}, overlap=${overlapFiltered.length} (${overlapGalaxies} galaxies), quality=${qualityFiltered.length}, averageFlux=${averageFluxFiltered.length}, displayed=${detections.length} (${displayedGalaxies} galaxies)`
+            `[SourceDetection] Ensemble post-processing model=${pointDetections.length}, confidence=${confidenceFiltered.length}, galaxies=${galaxyDetections.length}, spatial=${spatiallyFiltered.length}, overlap=${overlapFiltered.length} (${overlapGalaxies} galaxies), averageFlux=${averageFluxFiltered.length}, displayed=${detections.length} (${displayedGalaxies} galaxies)`
         );
         console.debug(
             `[SourceDetection] Displayed candidates ${JSON.stringify(
@@ -245,7 +264,7 @@ export class SourceDetectionService {
         return Number.isFinite(value) && value > CARTA_BLANK_PIXEL / 2;
     }
 
-    private prepareTensor(roi: RawRasterROI, inputChannels: number): Float32Array {
+    private prepareTensor(roi: RawRasterROI, inputChannels: number, stretch: InputStretch): Float32Array {
         const sampled = new Float32Array(MODEL_SIZE * MODEL_SIZE);
         const finite: number[] = [];
         for (let y = 0; y < MODEL_SIZE; y++) {
@@ -264,13 +283,17 @@ export class SourceDetectionService {
         const median = finite.length ? finite[Math.floor((finite.length - 1) / 2)] : 0;
         const deviations = finite.map(value => Math.abs(value - median)).sort((a, b) => a - b);
         const floor = deviations.length ? 1.4826 * deviations[Math.floor((deviations.length - 1) / 2)] : 0;
-        const ceiling = finite.length ? finite[Math.floor((finite.length - 1) * 0.995)] : 1;
-        const range = Math.max(ceiling - floor, 1e-10);
+        const referenceCeiling = finite.length ? finite[Math.floor((finite.length - 1) * 0.995)] : 1;
+        const referenceRange = Math.max(referenceCeiling - floor, 1e-10);
+        const maximum = finite.length ? finite[finite.length - 1] : referenceCeiling;
+        const maximumScaled = Math.max(1, (maximum - floor) / referenceRange);
+        const normalization = Math.asinh(INPUT_ASINH_STRETCH * maximumScaled);
         const tensor = new Float32Array(inputChannels * MODEL_SIZE * MODEL_SIZE);
 
         for (let index = 0; index < sampled.length; index++) {
             const raw = sampled[index];
-            const normalized = !this.isValidSciencePixel(raw) || raw < floor ? 0 : Math.max(0, Math.min(1, (raw - floor) / range));
+            const scaled = Math.max(0, (raw - floor) / referenceRange);
+            const normalized = !this.isValidSciencePixel(raw) || raw < floor || normalization <= 0 ? 0 : stretch === "asinh" ? Math.asinh(INPUT_ASINH_STRETCH * scaled) / normalization : Math.min(1, scaled);
             for (let channel = 0; channel < inputChannels; channel++) {
                 tensor[channel * sampled.length + index] = normalized;
             }
@@ -278,7 +301,7 @@ export class SourceDetectionService {
         return tensor;
     }
 
-    private parseOutput(output: ort.Tensor, roi: RawRasterROI, definition: SourceDetectionModelDefinition): SourceDetection[] {
+    private parseOutput(output: ort.Tensor, roi: RawRasterROI, definition: SourceDetectionModelDefinition, stretch: InputStretch): SourceDetection[] {
         const raw = output.data as Float32Array;
         const dims = output.dims;
         const classNames = definition.classNames;
@@ -292,10 +315,13 @@ export class SourceDetectionService {
             const modelCy = hasNormalizedCoordinates ? cy : cy / MODEL_SIZE;
             const modelWidth = hasNormalizedCoordinates ? Math.abs(width) : Math.abs(width) / MODEL_SIZE;
             const modelHeight = hasNormalizedCoordinates ? Math.abs(height) : Math.abs(height) / MODEL_SIZE;
-            // OnnxDetector.buildDetection clamps every viewport proposal to
-            // the same 10..640 image-pixel range.
-            const boxWidth = Math.max(10, Math.min(MODEL_SIZE, modelWidth * roi.imageWidth));
-            const boxHeight = Math.max(10, Math.min(MODEL_SIZE, modelHeight * roi.imageHeight));
+            // Keep the minimum in model-input pixels, then convert it to this
+            // viewport's image-pixel scale. A fixed 10 image-pixel minimum
+            // becomes an oversized box at high zoom and merges nearby sources.
+            const minimumBoxWidth = (10 / MODEL_SIZE) * roi.imageWidth;
+            const minimumBoxHeight = (10 / MODEL_SIZE) * roi.imageHeight;
+            const boxWidth = Math.max(minimumBoxWidth, Math.min(roi.imageWidth, modelWidth * roi.imageWidth));
+            const boxHeight = Math.max(minimumBoxHeight, Math.min(roi.imageHeight, modelHeight * roi.imageHeight));
             const x = roi.xMin + modelCx * roi.imageWidth - boxWidth / 2;
             const y = roi.yMin + modelCy * roi.imageHeight - boxHeight / 2;
             const safeClassId = Math.max(0, Math.min(classNames.length - 1, classId));
@@ -339,7 +365,7 @@ export class SourceDetectionService {
 
         const onnxCandidates = candidates.sort((a, b) => b.confidence - a.confidence).slice(0, MAX_ONNX_CANDIDATES);
         const kept = this.nonMaximumSuppression(onnxCandidates);
-        console.info(`[SourceDetection] ${definition.label} candidates=${candidates.length}, threshold=${RAW_CANDIDATE_THRESHOLD}, retained=${kept.length}`);
+        console.info(`[SourceDetection] ${definition.label} (${stretch}) candidates=${candidates.length}, threshold=${RAW_CANDIDATE_THRESHOLD}, retained=${kept.length}`);
         return kept;
     }
 
@@ -358,6 +384,9 @@ export class SourceDetectionService {
             kept.push(sorted[index]);
             for (let childIndex = index + 1; childIndex < sorted.length; childIndex++) {
                 const child = sorted[childIndex];
+                if (child.className !== sorted[index].className) {
+                    continue;
+                }
                 const overlapThreshold = child.confidence >= RAW_CONFIDENCE_KEEP_PRIORITY ? HIGH_RAW_NMS_IOU_THRESHOLD : NMS_IOU_THRESHOLD;
                 if (this.intersectionOverUnion(sorted[index].bboxPx, child.bboxPx) > overlapThreshold) {
                     suppressed.add(childIndex);
@@ -493,7 +522,12 @@ export class SourceDetectionService {
             return {intensity, weightedX, weightedY, weightedXX, weightedYY, weightedXY};
         };
 
-        const shouldUseConnectedPixels = EXTENDED_CLASS_NAMES.has(detection.className);
+        // A point proposal may still span multiple nearby peaks. Restrict its
+        // Gaussian moments to the component connected to the proposal's
+        // brightest peak so neighbouring sources are not fitted as one
+        // elongated point. Extended classes retain their existing connected
+        // component fitting; other compact classes keep the original window.
+        const shouldUseConnectedPixels = detection.className === "point" || EXTENDED_CLASS_NAMES.has(detection.className);
         let moments = accumulateMoments(Math.max(0, maximumSignal * 0.12), shouldUseConnectedPixels);
         if (moments.intensity === 0) {
             moments = accumulateMoments(0, shouldUseConnectedPixels);

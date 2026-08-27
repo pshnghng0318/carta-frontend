@@ -18,6 +18,8 @@ interface SourceDetectionOverlayComponentProps {
 }
 
 const DETECTION_DEBOUNCE_MS = 350;
+const TRACKING_MATCH_RADIUS_PX = 3;
+const MAX_TRACKED_SOURCES = 2000;
 // Source detection should not run as soon as a file is opened. Instead the
 // zoom level at the time the frame is mounted is recorded as the baseline,
 // and detection is only triggered once the user has zoomed in beyond this
@@ -28,7 +30,7 @@ const ZOOM_TRIGGER_MULTIPLIER = 3;
 // class names fall back to the default cyan below.
 const CLASS_COLORS: Record<string, string> = {
     point: "#00e5ff",
-    galaxy: "#1e3a8a",
+    galaxy: "#60a5fa",
     star: "#facc15",
     arc: "#f97316",
     jet: "#ef4444",
@@ -52,6 +54,11 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
     private rawTileRetryCount = 0;
     private shouldRerun = false;
     private lastCompletedCacheKey: string | undefined;
+    // Image-coordinate detections confirmed at any previous viewport for the
+    // current frame/channel/stokes. They let a source survive a later zoom at
+    // which scale- or morphology-sensitive ONNX confidence temporarily drops.
+    private trackedDetections: SourceDetection[] = [];
+    private trackingContext: string | undefined;
     private frameDisposer: IReactionDisposer | undefined;
     private tileSubscription: Subscription | undefined;
     // Zoom level recorded when the file was opened; detection stays disabled
@@ -179,10 +186,10 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
                 console.info("[SourceDetection] Discarded result because the viewport changed");
                 return;
             }
-            this.detections = result.detections;
+            this.detections = this.mergeTrackedDetections(frame, result.detections);
             this.lastCompletedCacheKey = result.cacheKey;
-            console.info(`[SourceDetection] Selected ${result.detections.length} source(s)`);
-            AppStore.Instance.logStore.addInfo(`Source detection selected ${result.detections.length} source(s).`, ["source-detection"]);
+            console.info(`[SourceDetection] Selected ${this.detections.length} source(s), including tracked positions`);
+            AppStore.Instance.logStore.addInfo(`Source detection selected ${this.detections.length} source(s), including tracked positions.`, ["source-detection"]);
         } catch (error) {
             if (generation === this.requestGeneration) {
                 console.error("[SourceDetection] Inference failed", error);
@@ -210,6 +217,38 @@ export class SourceDetectionOverlayComponent extends React.Component<SourceDetec
     private getEffectiveZoom = (frame: FrameStore) => {
         return frame.spatialReference?.zoomLevel ?? frame.zoomLevel;
     };
+
+    private mergeTrackedDetections(frame: FrameStore, currentDetections: SourceDetection[]): SourceDetection[] {
+        const context = `${frame.id}:${frame.channel}:${frame.stokes}`;
+        if (this.trackingContext !== context) {
+            this.trackingContext = context;
+            this.trackedDetections = [];
+        }
+
+        // A new detection replaces every historical detection at the same
+        // image position, even if the model changed its class after zooming.
+        // Historical positions with no current match remain available.
+        const unmatchedHistorical = this.trackedDetections.filter(previous => {
+            return !currentDetections.some(current => {
+                const deltaX = current.ellipsePx[0] - previous.ellipsePx[0];
+                const deltaY = current.ellipsePx[1] - previous.ellipsePx[1];
+                return deltaX * deltaX + deltaY * deltaY <= TRACKING_MATCH_RADIUS_PX * TRACKING_MATCH_RADIUS_PX;
+            });
+        });
+        this.trackedDetections = [...unmatchedHistorical, ...currentDetections];
+        if (this.trackedDetections.length > MAX_TRACKED_SOURCES) {
+            this.trackedDetections = this.trackedDetections.slice(this.trackedDetections.length - MAX_TRACKED_SOURCES);
+        }
+
+        const view = frame.requiredFrameView;
+        const visible = this.trackedDetections.filter(detection => {
+            const [centerX, centerY] = detection.ellipsePx;
+            return centerX >= view.xMin && centerX <= view.xMax && centerY >= view.yMin && centerY <= view.yMax;
+        });
+        const retainedCount = visible.length - currentDetections.length;
+        console.info(`[SourceDetection] Tracking current=${currentDetections.length}, retained=${Math.max(0, retainedCount)}, visible=${visible.length}, stored=${this.trackedDetections.length}`);
+        return visible;
+    }
 
     /** Whether the current zoom has crossed ZOOM_TRIGGER_MULTIPLIER times the zoom recorded when the file was opened. */
     private isZoomedInPastTrigger = () => {
